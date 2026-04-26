@@ -36,6 +36,10 @@ igai/
 - `QDRANT_URL`: Qdrant endpoint (required)
 - `QDRANT_API_KEY`: Qdrant API key (optional for local, required for cloud)
 - `QDRANT_COLLECTION`: default collection name (optional)
+- `QDRANT_CLOUD_INFERENCE`: set `true` to let Qdrant run inference for `Document(...)` payloads (default: `true`)
+- `SUPABASE_URL`: Supabase project URL for source rows
+- `SUPABASE_SERVICE_KEY`: Supabase service role key for REST reads
+- `TARGET_DATABASE_URL`: Neon/PostgreSQL SQLAlchemy connection URL
 
 ## Usage
 
@@ -80,10 +84,40 @@ report = build_health_report({
 })
 ```
 
+### Sync Supabase -> IPFS JSON -> Neon + Qdrant BM25
+
+The sync runner reads rows from Supabase (`type=1`), fetches JSON from IPFS by `cid`, normalizes + upserts into Neon, and (optionally) upserts text to Qdrant using cloud inference with model `qdrant/bm25`.
+
+Run one batch:
+
+```bash
+python -m igai.cli \
+  --state-file sync.json \
+  --batch-size 200 \
+  --target-table health_records \
+  --qdrant-collection health_embeddings
+```
+
+Run continuously (one-by-one with batch size 1):
+
+```bash
+python -m igai.cli \
+  --batch-size 1 \
+  --qdrant-collection health_embeddings \
+  --continuous \
+  --sleep-seconds 2
+```
+
+Notes:
+- `--state-file` tracks the latest synced Supabase `id` so restarts continue from where they stopped.
+- Set `--batch-size 1` if you want strict one-by-one ingestion.
+- Omit `--qdrant-collection` if you only want Neon storage.
+
 ## Notes
 
 - `normalize_record` uses safe dict access and returns `None` for missing values (PostgreSQL `NULL`).
 - `to_embedding_text` always includes all schema fields and uses `unknown` placeholders.
-- `upsert_vector` ensures collection existence and uses cosine similarity.
+- `upsert_vector` ensures collection existence and uses cosine similarity for dense vectors.
+- `upsert_bm25_document` creates a sparse BM25-compatible collection and uploads `Document(text=..., model="qdrant/bm25")` so inference is provided by Qdrant cloud.
 - `generate_analysis_script` supports trend, aggregation, and cohort comparison patterns.
 - `build_health_report` uses cautious language and avoids diagnosis statements.

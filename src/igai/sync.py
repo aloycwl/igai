@@ -12,7 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .embedding_text import to_embedding_text
 from .normalization import normalize_record
-from .vector_store import upsert_vector
+from .vector_store import upsert_bm25_document
 
 
 DEFAULT_SYNC_STATE_FILE = "sync.json"
@@ -185,10 +185,9 @@ def run_sync(
             conn.execute(upsert_stmt)
 
             if qdrant_collection:
-                vector = [float(len(embedding_text))]
-                upsert_vector(
+                upsert_bm25_document(
                     id=external_id,
-                    vector=vector,
+                    text=embedding_text,
                     metadata={"source_id": source_id, "cid": cid, "text": embedding_text},
                     collection_name=qdrant_collection,
                 )
