@@ -1,6 +1,6 @@
 # IGAI Health Data Processing
 
-Production-oriented backend utilities for processing health JSON records, creating embedding text, storing vectors in Qdrant, generating pandas analysis scripts from natural language, and creating structured health reports.
+Production-oriented backend utilities for processing health JSON records, creating embedding text, storing vectors in Qdrant, generating pandas analysis scripts from natural language, generating structured health reports, and running Supabase→IPFS→Neon sync jobs.
 
 ## Project Structure
 
@@ -16,7 +16,9 @@ igai/
         ├── embedding_text.py     # normalized record -> embedding text
         ├── vector_store.py       # Qdrant collection + upsert
         ├── query_codegen.py      # natural language -> pandas script
-        └── reporting.py          # aggregated metrics -> report dict
+        ├── reporting.py          # aggregated metrics -> report dict
+        ├── sync.py               # Supabase + IPFS + Neon sync orchestration
+        └── cli.py                # command line entrypoint for sync
 ```
 
 ## Setup
@@ -33,11 +35,53 @@ igai/
 
 ## Environment Variables
 
-- `QDRANT_URL`: Qdrant endpoint (required)
-- `QDRANT_API_KEY`: Qdrant API key (optional for local, required for cloud)
-- `QDRANT_COLLECTION`: default collection name (optional)
+- `SUPABASE_URL`: Supabase endpoint (source)
+- `SUPABASE_SERVICE_KEY`: Supabase service role key
+- `TARGET_DATABASE_URL`: Neon/Postgres SQLAlchemy URL (target)
+- `QDRANT_URL`: Qdrant endpoint (optional)
+- `QDRANT_API_KEY`: Qdrant API key (optional)
+- `QDRANT_COLLECTION`: vector collection name (optional)
 
-## Usage
+## Sync Behavior
+
+`run_sync` reads `public.igai` from Supabase with:
+- `type = 1`
+- `id > last_synced_id` (loaded from `sync.json`)
+- ordered by `id asc`
+
+For each row:
+1. download `https://<cid>.ipfs.w3s.link/`
+2. normalize payload
+3. write/upsert to Neon target table (`health_records` default)
+4. optionally upsert vector into Qdrant when `qdrant_collection` is provided
+
+It then updates `sync.json` with the newest processed id.
+
+No retries are included by design.
+
+## Running Sync
+
+Programmatic:
+
+```python
+from igai import run_sync
+
+result = run_sync(
+    sync_state_path="sync.json",
+    batch_size=200,
+    target_table="health_records",
+    qdrant_collection=None,
+)
+print(result)
+```
+
+CLI:
+
+```bash
+igai-sync --state-file sync.json --batch-size 200 --target-table health_records
+```
+
+## Usage (Core Functions)
 
 ```python
 from igai import (
@@ -48,42 +92,8 @@ from igai import (
     build_health_report,
 )
 
-raw = {
-    "vitalSigns": {
-        "heartRate": 96.2,
-        "spo2": 98.3,
-        "respiratoryRate": 28.2,
-        "stressScore": 46.6,
-        "hrvSdnn": 81.8,
-        "hrvRmssd": 56,
-        "bloodPressureSystolic": 110,
-        "bloodPressureDiastolic": 60,
-    },
-    "holisticHealth": {"generalWellness": 80.3},
-    "risks": {"cardiovascularRisks": {"generalRisk": 7.84, "stroke": 4.94}},
-}
-
-row = normalize_record(raw)
+row = normalize_record({})
 text = to_embedding_text(row)
-
-# vector = [0.01, 0.03, ...]
-# upsert_vector(id="record-1", vector=vector, metadata=row)
-
 script = generate_analysis_script("Show average heart rate trend over last 7 days")
-
-report = build_health_report({
-    "heart_rate_avg": 78,
-    "spo2_avg": 97.9,
-    "stress_score_avg": 42,
-    "cardiovascular_risk_avg": 5.1,
-    "general_wellness_avg": 81,
-})
+report = build_health_report({"heart_rate_avg": 78})
 ```
-
-## Notes
-
-- `normalize_record` uses safe dict access and returns `None` for missing values (PostgreSQL `NULL`).
-- `to_embedding_text` always includes all schema fields and uses `unknown` placeholders.
-- `upsert_vector` ensures collection existence and uses cosine similarity.
-- `generate_analysis_script` supports trend, aggregation, and cohort comparison patterns.
-- `build_health_report` uses cautious language and avoids diagnosis statements.
