@@ -1,28 +1,34 @@
 from __future__ import annotations
-
-import json
-import os
+import json, os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
 from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, MetaData, String, Table, create_engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-
 from .embedding_text import to_embedding_text
 from .normalization import normalize_record
-from .vector_store import upsert_bm25_document
-
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import PointStruct, Document
 
 DEFAULT_SYNC_STATE_FILE = "sync.json"
 DEFAULT_TARGET_TABLE = "health_records"
 
-
 def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> Any:
+    import time
     request = Request(url=url, method="GET", headers=headers or {})
-    with urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    retry_delays = [1, 5, 15]  # backoff seconds
+    
+    for attempt, delay in enumerate([0] + retry_delays):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as e:
+            if attempt == len(retry_delays):
+                raise  # final attempt failed, propagate
+            print(f"[WARNING] HTTP GET failed (attempt {attempt+1}/{len(retry_delays)+1}): {type(e).__name__}: {e}")
 
 
 def _load_sync_state(sync_state_path: str) -> Dict[str, Any]:
@@ -73,6 +79,7 @@ def _fetch_supabase_rows(
 
 def _fetch_ipfs_json(cid: str) -> Dict[str, Any]:
     url = f"https://{cid}.ipfs.w3s.link/"
+    print(f"[DEBUG] IPFS CID: {url}")
     data = _http_get_json(url)
     if not isinstance(data, dict):
         raise ValueError(f"IPFS payload for cid={cid} is not a JSON object")
@@ -153,10 +160,16 @@ def run_sync(
                 max_synced_id = max(max_synced_id, source_id)
                 continue
 
-            raw_payload = _fetch_ipfs_json(cid=cid)
+            try:
+                raw_payload = _fetch_ipfs_json(cid=cid)
+            except Exception as e:
+                print(f"[SKIP] Failed CID {cid}: {e}")
+                max_synced_id = max(max_synced_id, source_id)
+                continue
+
             normalized = normalize_record(raw_payload)
             embedding_text = to_embedding_text(normalized)
-            external_id = f"igai-{source_id}"
+            external_id = int(source_id)
 
             insert_payload = {
                 "external_id": external_id,
@@ -185,12 +198,53 @@ def run_sync(
             conn.execute(upsert_stmt)
 
             if qdrant_collection:
-                upsert_bm25_document(
-                    id=external_id,
-                    text=embedding_text,
-                    metadata={"source_id": source_id, "cid": cid, "text": embedding_text},
-                    collection_name=qdrant_collection,
+                client = QdrantClient(
+                    url=os.environ.get("QDRANT_URL"),
+                    api_key=os.environ.get("QDRANT_API_KEY"),
+                    cloud_inference=True,
                 )
+
+                point = PointStruct(
+                    id=int(external_id),
+                    payload={
+                        "source_id": source_id,
+                        "cid": cid,
+                        "heart_rate": normalized.get("heart_rate"),
+                        "spo2": normalized.get("spo2"),
+                        "respiratory_rate": normalized.get("respiratory_rate"),
+                        "stress_score": normalized.get("stress_score"),
+                        "hrv_sdnn": normalized.get("hrv_sdnn"),
+                        "hrv_rmssd": normalized.get("hrv_rmssd"),
+                        "systolic_bp": normalized.get("systolic_bp"),
+                        "diastolic_bp": normalized.get("diastolic_bp"),
+                        "cardiovascular_risk": normalized.get("cardiovascular_risk"),
+                        "stroke_risk": normalized.get("stroke_risk"),
+                        "general_wellness": normalized.get("general_wellness"),
+                    },
+                    vector={
+                        "embedding": Document(
+                            text=embedding_text,
+                            model="sentence-transformers/all-MiniLM-L6-v2"
+                        )
+                    }
+                )
+
+                import time
+                qdrant_retry_delays = [3, 10, 30]
+                for attempt, delay in enumerate([0] + qdrant_retry_delays):
+                    if delay > 0:
+                        time.sleep(delay)
+                    try:
+                        client.upsert(
+                            collection_name=qdrant_collection,
+                            points=[point]
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == len(qdrant_retry_delays):
+                            print(f"[ERROR] Qdrant upsert failed permanently for id {external_id}: {type(e).__name__}: {e}")
+                            raise
+                        print(f"[WARNING] Qdrant upsert failed (attempt {attempt+1}/{len(qdrant_retry_delays)+1}): {type(e).__name__}: {e}")
 
             synced_count += 1
             max_synced_id = max(max_synced_id, source_id)
