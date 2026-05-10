@@ -1,24 +1,35 @@
 from __future__ import annotations
-import json, os
+
+import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
 from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, MetaData, String, Table, create_engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from .embedding_text import to_embedding_text
 from .normalization import normalize_record
+
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, Document
 
 DEFAULT_SYNC_STATE_FILE = "sync.json"
 DEFAULT_TARGET_TABLE = "health_records"
+IPFS_FETCH_WORKERS = 8
+
+_engine_table_cache: Dict[str, Tuple[Any, Table]] = {}
+_qdrant_client_cache: Optional[QdrantClient] = None
+
 
 def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> Any:
-    import time
     request = Request(url=url, method="GET", headers=headers or {})
-    retry_delays = [1, 5, 15]  # backoff seconds
-    
+    retry_delays = [1, 5, 15]
+
     for attempt, delay in enumerate([0] + retry_delays):
         if delay > 0:
             time.sleep(delay)
@@ -27,7 +38,7 @@ def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> Any:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as e:
             if attempt == len(retry_delays):
-                raise  # final attempt failed, propagate
+                raise
             print(f"[WARNING] HTTP GET failed (attempt {attempt+1}/{len(retry_delays)+1}): {type(e).__name__}: {e}")
 
 
@@ -86,7 +97,36 @@ def _fetch_ipfs_json(cid: str) -> Dict[str, Any]:
     return data
 
 
-def _get_target_table(target_database_url: str, table_name: str) -> tuple[Any, Table]:
+def _fetch_ipfs_parallel(
+    rows: List[Dict[str, Any]], max_workers: int = IPFS_FETCH_WORKERS
+) -> Dict[int, Optional[Dict[str, Any]]]:
+    results: Dict[int, Optional[Dict[str, Any]]] = {}
+
+    def _fetch_one(row: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+        source_id = int(row.get("id"))
+        cid = row.get("cid")
+        if not cid:
+            return source_id, None
+        try:
+            return source_id, _fetch_ipfs_json(cid=cid)
+        except Exception as e:
+            print(f"[SKIP] Failed CID {cid}: {e}")
+            return source_id, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_one, row) for row in rows]
+        for future in as_completed(futures):
+            source_id, payload = future.result()
+            results[source_id] = payload
+
+    return results
+
+
+def _get_or_create_engine(target_database_url: str, table_name: str) -> Tuple[Any, Table]:
+    cache_key = f"{target_database_url}|{table_name}"
+    if cache_key in _engine_table_cache:
+        return _engine_table_cache[cache_key]
+
     engine = create_engine(target_database_url, future=True)
     metadata = MetaData()
 
@@ -113,7 +153,51 @@ def _get_target_table(target_database_url: str, table_name: str) -> tuple[Any, T
     )
 
     metadata.create_all(engine)
+    _engine_table_cache[cache_key] = (engine, table)
     return engine, table
+
+
+def _get_qdrant_client() -> QdrantClient:
+    global _qdrant_client_cache
+    if _qdrant_client_cache is not None:
+        return _qdrant_client_cache
+    _qdrant_client_cache = QdrantClient(
+        url=os.environ.get("QDRANT_URL"),
+        api_key=os.environ.get("QDRANT_API_KEY"),
+        cloud_inference=True,
+    )
+    return _qdrant_client_cache
+
+
+def _qdrant_upsert_batch(client: QdrantClient, collection_name: str, points: List[PointStruct]) -> None:
+    retry_delays = [3, 10, 30]
+    for attempt, delay in enumerate([0] + retry_delays):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            client.upsert(collection_name=collection_name, points=points)
+            return
+        except Exception as e:
+            if attempt == len(retry_delays):
+                print(f"[ERROR] Qdrant batch upsert failed permanently: {type(e).__name__}: {e}")
+                raise
+            print(f"[WARNING] Qdrant upsert failed (attempt {attempt+1}/{len(retry_delays)+1}): {type(e).__name__}: {e}")
+
+
+def _qdrant_upsert_individual(client: QdrantClient, collection_name: str, points: List[PointStruct]) -> None:
+    for point in points:
+        retry_delays = [3, 10, 30]
+        for attempt, delay in enumerate([0] + retry_delays):
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                client.upsert(collection_name=collection_name, points=[point])
+                break
+            except Exception as e:
+                if attempt == len(retry_delays):
+                    print(f"[ERROR] Qdrant upsert failed permanently for id {point.id}: {type(e).__name__}: {e}")
+                else:
+                    print(f"[WARNING] Qdrant upsert failed (attempt {attempt+1}/{len(retry_delays)+1}) for id {point.id}: {type(e).__name__}: {e}")
 
 
 def run_sync(
@@ -147,107 +231,93 @@ def run_sync(
     if not rows:
         return {"synced": 0, "last_synced_id": last_synced_id}
 
-    engine, table = _get_target_table(target_database_url=target_database_url, table_name=target_table)
+    max_synced_id = max(int(row.get("id")) for row in rows)
 
+    ipfs_results = _fetch_ipfs_parallel(rows)
+
+    engine, table = _get_or_create_engine(target_database_url=target_database_url, table_name=target_table)
+
+    db_payloads: List[Dict[str, Any]] = []
+    qdrant_points: List[PointStruct] = []
     synced_count = 0
-    max_synced_id = last_synced_id
 
-    with engine.begin() as conn:
-        for row in rows:
-            source_id = int(row.get("id"))
+    for row in rows:
+        source_id = int(row.get("id"))
+        raw_payload = ipfs_results.get(source_id)
+        if raw_payload is None:
+            continue
+
+        normalized = normalize_record(raw_payload)
+        embedding_text = to_embedding_text(normalized)
+        external_id = int(source_id)
+
+        insert_payload = {
+            "external_id": external_id,
+            "source_id": source_id,
+            "created_at": row.get("created_at"),
+            "user_id": normalized.get("user_id"),
+            "timestamp": normalized.get("timestamp"),
+            "heart_rate": normalized.get("heart_rate"),
+            "spo2": normalized.get("spo2"),
+            "respiratory_rate": normalized.get("respiratory_rate"),
+            "stress_score": normalized.get("stress_score"),
+            "hrv_sdnn": normalized.get("hrv_sdnn"),
+            "hrv_rmssd": normalized.get("hrv_rmssd"),
+            "systolic_bp": normalized.get("systolic_bp"),
+            "diastolic_bp": normalized.get("diastolic_bp"),
+            "cardiovascular_risk": normalized.get("cardiovascular_risk"),
+            "stroke_risk": normalized.get("stroke_risk"),
+            "general_wellness": normalized.get("general_wellness"),
+            "raw_payload": raw_payload,
+        }
+        db_payloads.append(insert_payload)
+
+        if qdrant_collection:
             cid = row.get("cid")
-            if not cid:
-                max_synced_id = max(max_synced_id, source_id)
-                continue
+            point = PointStruct(
+                id=int(external_id),
+                payload={
+                    "source_id": source_id,
+                    "cid": cid,
+                    "heart_rate": normalized.get("heart_rate"),
+                    "spo2": normalized.get("spo2"),
+                    "respiratory_rate": normalized.get("respiratory_rate"),
+                    "stress_score": normalized.get("stress_score"),
+                    "hrv_sdnn": normalized.get("hrv_sdnn"),
+                    "hrv_rmssd": normalized.get("hrv_rmssd"),
+                    "systolic_bp": normalized.get("systolic_bp"),
+                    "diastolic_bp": normalized.get("diastolic_bp"),
+                    "cardiovascular_risk": normalized.get("cardiovascular_risk"),
+                    "stroke_risk": normalized.get("stroke_risk"),
+                    "general_wellness": normalized.get("general_wellness"),
+                },
+                vector={
+                    "embedding": Document(
+                        text=embedding_text,
+                        model="sentence-transformers/all-MiniLM-L6-v2",
+                    )
+                },
+            )
+            qdrant_points.append(point)
 
-            try:
-                raw_payload = _fetch_ipfs_json(cid=cid)
-            except Exception as e:
-                print(f"[SKIP] Failed CID {cid}: {e}")
-                max_synced_id = max(max_synced_id, source_id)
-                continue
+        synced_count += 1
 
-            normalized = normalize_record(raw_payload)
-            embedding_text = to_embedding_text(normalized)
-            external_id = int(source_id)
-
-            insert_payload = {
-                "external_id": external_id,
-                "source_id": source_id,
-                "created_at": row.get("created_at"),
-                "user_id": normalized.get("user_id"),
-                "timestamp": normalized.get("timestamp"),
-                "heart_rate": normalized.get("heart_rate"),
-                "spo2": normalized.get("spo2"),
-                "respiratory_rate": normalized.get("respiratory_rate"),
-                "stress_score": normalized.get("stress_score"),
-                "hrv_sdnn": normalized.get("hrv_sdnn"),
-                "hrv_rmssd": normalized.get("hrv_rmssd"),
-                "systolic_bp": normalized.get("systolic_bp"),
-                "diastolic_bp": normalized.get("diastolic_bp"),
-                "cardiovascular_risk": normalized.get("cardiovascular_risk"),
-                "stroke_risk": normalized.get("stroke_risk"),
-                "general_wellness": normalized.get("general_wellness"),
-                "raw_payload": raw_payload,
-            }
-            stmt = pg_insert(table).values(insert_payload)
+    if db_payloads:
+        with engine.begin() as conn:
+            stmt = pg_insert(table).values(db_payloads)
             upsert_stmt = stmt.on_conflict_do_update(
                 index_elements=[table.c.external_id],
-                set_=insert_payload,
+                set_={c.name: stmt.excluded[c.name] for c in table.columns if c.name != "external_id"},
             )
             conn.execute(upsert_stmt)
 
-            if qdrant_collection:
-                client = QdrantClient(
-                    url=os.environ.get("QDRANT_URL"),
-                    api_key=os.environ.get("QDRANT_API_KEY"),
-                    cloud_inference=True,
-                )
-
-                point = PointStruct(
-                    id=int(external_id),
-                    payload={
-                        "source_id": source_id,
-                        "cid": cid,
-                        "heart_rate": normalized.get("heart_rate"),
-                        "spo2": normalized.get("spo2"),
-                        "respiratory_rate": normalized.get("respiratory_rate"),
-                        "stress_score": normalized.get("stress_score"),
-                        "hrv_sdnn": normalized.get("hrv_sdnn"),
-                        "hrv_rmssd": normalized.get("hrv_rmssd"),
-                        "systolic_bp": normalized.get("systolic_bp"),
-                        "diastolic_bp": normalized.get("diastolic_bp"),
-                        "cardiovascular_risk": normalized.get("cardiovascular_risk"),
-                        "stroke_risk": normalized.get("stroke_risk"),
-                        "general_wellness": normalized.get("general_wellness"),
-                    },
-                    vector={
-                        "embedding": Document(
-                            text=embedding_text,
-                            model="sentence-transformers/all-MiniLM-L6-v2"
-                        )
-                    }
-                )
-
-                import time
-                qdrant_retry_delays = [3, 10, 30]
-                for attempt, delay in enumerate([0] + qdrant_retry_delays):
-                    if delay > 0:
-                        time.sleep(delay)
-                    try:
-                        client.upsert(
-                            collection_name=qdrant_collection,
-                            points=[point]
-                        )
-                        break
-                    except Exception as e:
-                        if attempt == len(qdrant_retry_delays):
-                            print(f"[ERROR] Qdrant upsert failed permanently for id {external_id}: {type(e).__name__}: {e}")
-                            raise
-                        print(f"[WARNING] Qdrant upsert failed (attempt {attempt+1}/{len(qdrant_retry_delays)+1}): {type(e).__name__}: {e}")
-
-            synced_count += 1
-            max_synced_id = max(max_synced_id, source_id)
+    if qdrant_collection and qdrant_points:
+        client = _get_qdrant_client()
+        try:
+            _qdrant_upsert_batch(client, qdrant_collection, qdrant_points)
+        except Exception:
+            print("[FALLBACK] Batch upsert failed, retrying points individually...")
+            _qdrant_upsert_individual(client, qdrant_collection, qdrant_points)
 
     _save_sync_state(sync_state_path=sync_state_path, last_synced_id=max_synced_id)
 

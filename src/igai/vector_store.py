@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, Document, PointStruct, SparseVectorParams, VectorParams
@@ -55,8 +55,9 @@ def upsert_vector(
     vector: List[float],
     metadata: Dict[str, Any],
     collection_name: str = DEFAULT_COLLECTION,
+    client: Optional[QdrantClient] = None,
 ) -> None:
-    client = get_qdrant_client()
+    client = client or get_qdrant_client()
     ensure_collection(client=client, collection_name=collection_name, vector_size=len(vector))
 
     point = PointStruct(id=id, vector=vector, payload=metadata or {})
@@ -70,8 +71,9 @@ def upsert_bm25_document(
     collection_name: str = DEFAULT_COLLECTION,
     vector_name: str = "text",
     model: str = "qdrant/bm25",
+    client: Optional[QdrantClient] = None,
 ) -> None:
-    client = get_qdrant_client()
+    client = client or get_qdrant_client()
     ensure_bm25_collection(client=client, collection_name=collection_name, vector_name=vector_name)
 
     point = PointStruct(
