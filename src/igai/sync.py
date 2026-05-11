@@ -89,12 +89,26 @@ def _fetch_supabase_rows(
 
 
 def _fetch_ipfs_json(cid: str) -> Dict[str, Any]:
-    url = f"https://{cid}.ipfs.w3s.link/"
-    print(f"[DEBUG] IPFS CID: {url}")
-    data = _http_get_json(url)
-    if not isinstance(data, dict):
-        raise ValueError(f"IPFS payload for cid={cid} is not a JSON object")
-    return data
+    gateways = [
+        f"https://{cid}.ipfs.w3s.link/",
+        f"https://cloudflare-ipfs.com/ipfs/{cid}/",
+        f"https://ipfs.io/ipfs/{cid}/",
+        f"https://dweb.link/ipfs/{cid}/"
+    ]
+
+    last_exception = None
+    for url in gateways:
+        print(f"[DEBUG] Trying IPFS CID via: {url}")
+        try:
+            data = _http_get_json(url)
+            if not isinstance(data, dict):
+                raise ValueError(f"IPFS payload for cid={cid} via {url} is not a JSON object")
+            return data
+        except Exception as e:
+            print(f"[DEBUG] Failed to fetch {url}: {e}")
+            last_exception = e
+
+    raise ValueError(f"All gateways failed for cid={cid}. Last error: {last_exception}")
 
 
 def _fetch_ipfs_parallel(
@@ -229,8 +243,9 @@ def run_sync(
     )
 
     if not rows:
-        return {"synced": 0, "last_synced_id": last_synced_id}
+        return {"synced": 0, "fetched": 0, "last_synced_id": last_synced_id}
 
+    fetched_count = len(rows)
     max_synced_id = max(int(row.get("id")) for row in rows)
 
     ipfs_results = _fetch_ipfs_parallel(rows)
@@ -323,6 +338,7 @@ def run_sync(
 
     return {
         "synced": synced_count,
+        "fetched": fetched_count,
         "last_synced_id": max_synced_id,
         "state_file": sync_state_path,
         "target_table": target_table,

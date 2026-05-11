@@ -21,6 +21,7 @@ def main() -> None:
             print(json.dumps(result, indent=2))
 
             synced = int(result.get("synced", 0))
+            fetched = int(result.get("fetched", 0))
             processed += synced
 
             print(
@@ -30,7 +31,7 @@ def main() -> None:
                 )
             )
 
-            if synced == 0:
+            if fetched == 0:
                 print("No more records found. Exiting.")
                 break
 
